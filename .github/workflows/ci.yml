@@ -28,3 +28,10 @@ jobs:
  
       - name: SonarCloud Analysis
         run: mvn sonar:sonar -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+      - name: Deploy Artifact to JFrog
+        run: mvn deploy --settings .mvn/settings.xml
+        env:
+          JFROG_URL: ${{ secrets.JFROG_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}

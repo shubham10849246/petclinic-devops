@@ -421,4 +421,10 @@
       </build>
     </profile>
   </profiles>
+  <distributionManagement>
+    <repository>
+        <id>jfrog</id>
+        <url>${env.JFROG_URL}/artifactory/petclinic-maven-local</url>
+    </repository>
+</distributionManagement>
 </project>

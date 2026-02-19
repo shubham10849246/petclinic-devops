@@ -35,3 +35,34 @@ jobs:
           JFROG_URL: ${{ secrets.JFROG_URL }}
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
           JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+ 
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+ 
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }} .
+      
+      - name: Tag Docker image
+        run: |
+          docker tag ${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }}
+ 
+      - name: Push Docker image
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }}
+ 
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+ 
+      - name: Deploy to EKS
+        run: |
+          kubectl set image deployment/petclinic-deployment petclinic=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }}

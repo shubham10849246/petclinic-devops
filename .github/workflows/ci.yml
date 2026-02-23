@@ -78,3 +78,39 @@ jobs:
       - name: Deploy to EKS
         run: |
           kubectl set image deployment/petclinic-deployment petclinic=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.run_number }}
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/petclinic --timeout=180s
+
+      - name: Wait for LoadBalancer to be ready
+        run: |
+          echo "Waiting for LoadBalancer..."
+          for i in {1..30}; do
+            LB=$(kubectl get svc petclinic -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$LB" ]; then
+              echo "LoadBalancer found: $LB"
+              echo "APP_URL=http://$LB" >> $GITHUB_ENV
+              break
+            fi
+            echo "Still waiting..."
+            sleep 10
+          done
+
+          # Fail the step if LB is still empty after retries
+          if [ -z "$LB" ]; then
+            echo "LoadBalancer not ready after waiting."
+            exit 1
+          fi
+
+      - name: Smoke Test Homepage
+        run: |
+          echo "Testing $APP_URL"
+          curl -f --retry 5 --retry-delay 5 "$APP_URL"
+
+      - name: Rollback if smoke test fails
+        if: failure()
+        run: |
+          echo "Smoke test failed. Rolling back..."
+          kubectl rollout undo deployment/petclinic
+          kubectl rollout status deployment/petclinic --timeout=180s

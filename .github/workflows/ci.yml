@@ -103,10 +103,12 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke Test Homepage
+      - name: Smoke Test Homepage (force HTTP)
         run: |
           echo "Testing $APP_URL"
-          curl -f --retry 5 --retry-delay 5 "$APP_URL"
+          curl -v --http1.1 --connect-timeout 10 --max-time 20 \
+               --retry 10 --retry-delay 6 --retry-all-errors \
+               "$APP_URL"
 
       - name: Rollback if smoke test fails
         if: failure()

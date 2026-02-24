@@ -81,7 +81,7 @@ jobs:
 
       - name: Wait for deployment rollout
         run: |
-          kubectl rollout status deployment/petclinic --timeout=180s
+          kubectl rollout status deployment/petclinic-deployment --timeout=180s
 
       - name: Wait for LoadBalancer to be ready
         run: |
@@ -112,5 +112,5 @@ jobs:
         if: failure()
         run: |
           echo "Smoke test failed. Rolling back..."
-          kubectl rollout undo deployment/petclinic
-          kubectl rollout status deployment/petclinic --timeout=180s
+          kubectl rollout undo deployment/petclinic-deployment
+          kubectl rollout status deployment/petclinic-deployment --timeout=180s

@@ -103,13 +103,30 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke Test Homepage (force HTTP)
+      
+      - name: Wait for app to be reachable via LoadBalancer
         run: |
-          echo "Testing $APP_URL"
+          echo "Waiting for app URL to respond: $APP_URL"
+          for i in {1..40}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$APP_URL" || true)
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "App is reachable!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "App did not become reachable in time"
+          exit 1
+
+          
+      - name: Smoke Test Homepage (verbose)
+        run: |
           curl -v --http1.1 --connect-timeout 10 --max-time 20 \
                --retry 10 --retry-delay 6 --retry-all-errors \
                "$APP_URL"
 
+      
       - name: Rollback if smoke test fails
         if: failure()
         run: |

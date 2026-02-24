@@ -87,7 +87,7 @@ jobs:
         run: |
           echo "Waiting for LoadBalancer..."
           for i in {1..30}; do
-            LB=$(kubectl get svc petclinic -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            LB=$(kubectl get svc petclinic-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
             if [ -n "$LB" ]; then
               echo "LoadBalancer found: $LB"
               echo "APP_URL=http://$LB" >> $GITHUB_ENV

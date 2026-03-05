@@ -290,7 +290,7 @@ jobs:
           curl -sS --connect-timeout 5 --max-time 20 \
             -X POST "${GUARDIAN_URL}" \
             -H "Authorization: Bearer ${GUARDIAN_TOKEN}" \
-            -F "metadata=@metadata.json;type=application/json" \
+            -F "meta=@metadata.json;type=application/json" \
             -F "maven_log=@maven.log;type=text/plain" \
             -F "docker_log=@docker-build.log;type=text/plain" \
             -F "deploy_log=@deploy.log;type=text/plain" \

@@ -288,7 +288,7 @@ jobs:
           # Try calling Guardian. If it fails, write fallback JSON and continue.
           set +e
           curl -sS --connect-timeout 5 --max-time 20 \
-            -X POST "${GUARDIAN_URL}/analyze" \
+            -X POST "${GUARDIAN_URL}" \
             -H "Authorization: Bearer ${GUARDIAN_TOKEN}" \
             -F "metadata=@metadata.json;type=application/json" \
             -F "maven_log=@maven.log;type=text/plain" \

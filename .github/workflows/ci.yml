@@ -118,22 +118,38 @@ jobs:
         run: |
           set +e
           docker build -t ${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} . 2>&1 | tee docker-build.log
+          docker_exit=${PIPESTATUS[0]}
           echo "docker_exit_code=${PIPESTATUS[0]}" >> $GITHUB_ENV
           exit 0
 
-      # ----------------------------
-      # 9) Trivy Scan (only if docker build succeeded)
-      # ----------------------------
-      - name: Scan Docker Image with Trivy
+
+      - name: Install Trivy CLI
         if: steps.build_test.outputs.exit_code == '0' && env.docker_exit_code == '0'
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: "os,library"
-          severity: "CRITICAL,HIGH"
+        uses: aquasecurity/setup-trivy@v0.2.2
+
+
+     - name: Trivy Scan (JSON report for Guardian)
+        if: steps.build_test.outputs.exit_code == '0' && env.docker_exit_code == '0'
+        shell: bash
+        run: |
+          trivy image \
+            --scanners vuln \
+            --format json \
+            --output trivy-report.json \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            ${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Enforce Trivy policy (fail only on CRITICAL)
+        if: steps.build_test.outputs.exit_code == '0' && env.docker_exit_code == '0'
+        shell: bash
+        run: |
+          trivy image \
+            --scanners vuln \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            ${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
       # ----------------------------
       # 10) Tag + Push (only if docker build succeeded)

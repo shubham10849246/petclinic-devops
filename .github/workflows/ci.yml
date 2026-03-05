@@ -13,7 +13,7 @@ jobs:
     env:
       # Guardian endpoint (store in GitHub Secrets)
       GUARDIAN_URL: ${{ secrets.GUARDIAN_URL }}
-      GUARDIAN_TOKEN: ${{ secrets.GUARDIAN_TOKEN }}
+      # GUARDIAN_TOKEN: ${{ secrets.GUARDIAN_TOKEN }}
 
       # Image tag
       IMAGE_TAG: ${{ github.run_number }}

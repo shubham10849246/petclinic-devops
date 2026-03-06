@@ -1,0 +1,142 @@
+name: CD - Deploy to EKS
+
+on:
+  workflow_run:
+    workflows: ["CI - Build, Scan, Push"]
+    types: [completed]
+
+jobs:
+  cd:
+    # Only deploy after successful CI that was triggered by a PUSH to master (i.e., merge)
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master'
+
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_TAG: ${{ github.event.workflow_run.run_number }}
+      DEPLOY_EXIT_CODE: "NA"
+      EKS_READY: "false"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+          echo "EKS_READY=true" >> "$GITHUB_ENV"
+
+      - name: Deploy to EKS (save logs)
+        shell: bash
+        run: |
+          : > deploy.log
+          set +e
+
+          echo "=== kubectl set image ===" | tee -a deploy.log
+          kubectl set image deployment/petclinic-deployment \
+            petclinic=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} 2>&1 | tee -a deploy.log
+          setimg_code=${PIPESTATUS[0]}
+
+          echo "=== rollout status ===" | tee -a deploy.log
+          kubectl rollout status deployment/petclinic-deployment --timeout=180s 2>&1 | tee -a deploy.log
+          rollout_code=${PIPESTATUS[0]}
+
+          if [ "$setimg_code" -ne 0 ] || [ "$rollout_code" -ne 0 ]; then
+            echo "=== pods ===" | tee -a deploy.log
+            kubectl get pods -o wide 2>&1 | tee -a deploy.log || true
+
+            echo "=== events (last 50) ===" | tee -a deploy.log
+            kubectl get events --sort-by=.lastTimestamp | tail -n 50 2>&1 | tee -a deploy.log || true
+          fi
+
+          final_code=$((setimg_code!=0 ? setimg_code : rollout_code))
+          echo "DEPLOY_EXIT_CODE=$final_code" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Wait for LoadBalancer to be ready
+        if: env.DEPLOY_EXIT_CODE == '0'
+        run: |
+          echo "Waiting for LoadBalancer..."
+          for i in {1..30}; do
+            LB=$(kubectl get svc petclinic-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$LB" ]; then
+              echo "LoadBalancer found: $LB"
+              echo "APP_URL=http://$LB" >> "$GITHUB_ENV"
+              break
+            fi
+            echo "Still waiting..."
+            sleep 10
+          done
+          if [ -z "$LB" ]; then
+            echo "LoadBalancer not ready after waiting."
+            exit 1
+          fi
+
+      - name: Wait for app to be reachable via LoadBalancer
+        if: env.DEPLOY_EXIT_CODE == '0'
+        run: |
+          echo "Waiting for app URL to respond: $APP_URL"
+          for i in {1..40}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$APP_URL" || true)
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "App is reachable!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "App did not become reachable in time"
+          exit 1
+
+      - name: Smoke Test Homepage (verbose)
+        if: env.DEPLOY_EXIT_CODE == '0'
+        run: |
+          curl -v --http1.1 --connect-timeout 10 --max-time 20 \
+               --retry 10 --retry-delay 6 --retry-all-errors \
+               "$APP_URL"
+
+      - name: Rollback if smoke test fails
+        if: failure() && env.EKS_READY == 'true'
+        run: |
+          echo "Smoke test failed. Rolling back..."
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+          kubectl rollout undo deployment/petclinic-deployment
+          kubectl rollout status deployment/petclinic-deployment --timeout=180s
+
+      - name: Ensure deploy.log exists
+        if: always()
+        shell: bash
+        run: |
+          [ -f deploy.log ] || echo "deploy.log missing" > deploy.log
+
+      - name: Upload CD artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-artifacts
+          path: |
+            deploy.log
+
+      - name: Fail CD if deployment failed
+        if: always()
+        shell: bash
+        run: |
+          if [ "${DEPLOY_EXIT_CODE}" != "0" ] && [ "${DEPLOY_EXIT_CODE}" != "NA" ]; then
+            echo "Deploy failed."
+            exit 1
+          fi
+          echo "CD completed successfully."

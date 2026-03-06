@@ -1,4 +1,4 @@
-name: Java CI
+name: CI - Build, Scan, Push
 
 on:
   push:
@@ -7,52 +7,21 @@ on:
     branches: [ master ]
 
 jobs:
-  build:
+  ci:
     runs-on: ubuntu-latest
 
     env:
       IMAGE_TAG: ${{ github.run_number }}
-      GUARDIAN_URL: ${{ secrets.GUARDIAN_URL }}
-      GUARDIAN_TOKEN: ${{ secrets.GUARDIAN_TOKEN }}
-
-      # defaults so "NA" doesn't happen
       DOCKER_EXIT_CODE: "NA"
-      DEPLOY_EXIT_CODE: "NA"
-      EKS_READY: "false"
 
     steps:
-      # ----------------------------
       # 1) Checkout
-      # ----------------------------
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ----------------------------
-      # 2) Metadata for Guardian
-      # ----------------------------
-      - name: Create metadata for Guardian
-        shell: bash
-        run: |
-          cat <<EOF > metadata.json
-          {
-            "source": "github-actions",
-            "repo": "${{ github.repository }}",
-            "workflow": "${{ github.workflow }}",
-            "job": "build",
-            "run_id": "${{ github.run_id }}",
-            "run_number": "${{ github.run_number }}",
-            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "branch": "${{ github.ref_name }}",
-            "commit": "${{ github.sha }}",
-            "actor": "${{ github.actor }}"
-          }
-          EOF
-
-      # ----------------------------
-      # 3) Java setup
-      # ----------------------------
+      # 2) Java setup
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -60,9 +29,7 @@ jobs:
           java-version: "17"
           cache: maven
 
-      # ----------------------------
-      # 4) Build & Test (capture log + keep exit code)
-      # ----------------------------
+      # 3) Build & Test (save logs; keep exit code)
       - name: Build and Test (save logs)
         id: build_test
         shell: bash
@@ -73,16 +40,12 @@ jobs:
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit 0
 
-      # ----------------------------
-      # 5) Sonar (only if build ok)
-      # ----------------------------
+      # 4) Sonar (only if build ok)
       - name: SonarCloud Analysis
         if: steps.build_test.outputs.exit_code == '0'
         run: mvn sonar:sonar -Dsonar.login=${{ secrets.SONAR_TOKEN }}
 
-      # ----------------------------
-      # 6) JFrog deploy (only if build ok)
-      # ----------------------------
+      # 5) Deploy Artifact to JFrog (only if build ok)
       - name: Deploy Artifact to JFrog
         if: steps.build_test.outputs.exit_code == '0'
         run: mvn deploy --settings .mvn/settings.xml
@@ -91,9 +54,7 @@ jobs:
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
           JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
 
-      # ----------------------------
-      # 7) AWS creds + ECR login (only if build ok)
-      # ----------------------------
+      # 6) AWS creds + ECR login (only if build ok)
       - name: Configure AWS Credentials
         if: steps.build_test.outputs.exit_code == '0'
         uses: aws-actions/configure-aws-credentials@v4
@@ -107,9 +68,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ----------------------------
-      # 8) Docker build (capture log + store exit code)
-      # ----------------------------
+      # 7) Docker build (save logs + store exit code)
       - name: Build Docker image (save logs)
         if: steps.build_test.outputs.exit_code == '0'
         shell: bash
@@ -120,15 +79,12 @@ jobs:
           echo "DOCKER_EXIT_CODE=$docker_code" >> "$GITHUB_ENV"
           exit 0
 
-      # ============================================================
-      # 9) Trivy (Option C): Report HIGH+CRITICAL in JSON,
-      #    BUT fail pipeline only on CRITICAL (policy step)
-      # ============================================================
+      # 8) Trivy scan & policy
       - name: Install Trivy CLI
         if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
         uses: aquasecurity/setup-trivy@v0.2.2
 
-      - name: Trivy Scan (JSON report for Guardian)
+      - name: Trivy Scan (JSON report)
         if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
         shell: bash
         run: |
@@ -151,9 +107,7 @@ jobs:
             --exit-code 1 \
             ${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-      # ----------------------------
-      # 10) Tag + Push (only if build ok and docker ok)
-      # ----------------------------
+      # 9) Tag + Push (only if docker ok)
       - name: Tag Docker image
         if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
         run: |
@@ -165,176 +119,27 @@ jobs:
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-      # ----------------------------
-      # 11) EKS kubeconfig + deploy (capture deploy logs)
-      # ----------------------------
-      - name: Update kubeconfig
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
-        run: |
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
-          echo "EKS_READY=true" >> "$GITHUB_ENV"
-
-      - name: Deploy to EKS (save logs)
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
-        shell: bash
-        run: |
-          : > deploy.log
-          set +e
-
-          echo "=== kubectl set image ===" | tee -a deploy.log
-          kubectl set image deployment/petclinic-deployment \
-            petclinic=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} 2>&1 | tee -a deploy.log
-          setimg_code=${PIPESTATUS[0]}
-
-          echo "=== rollout status ===" | tee -a deploy.log
-          kubectl rollout status deployment/petclinic-deployment --timeout=180s 2>&1 | tee -a deploy.log
-          rollout_code=${PIPESTATUS[0]}
-
-          if [ "$setimg_code" -ne 0 ] || [ "$rollout_code" -ne 0 ]; then
-            echo "=== pods ===" | tee -a deploy.log
-            kubectl get pods -o wide 2>&1 | tee -a deploy.log || true
-
-            echo "=== events (last 50) ===" | tee -a deploy.log
-            kubectl get events --sort-by=.lastTimestamp | tail -n 50 2>&1 | tee -a deploy.log || true
-          fi
-
-          final_code=$((setimg_code!=0 ? setimg_code : rollout_code))
-          echo "DEPLOY_EXIT_CODE=$final_code" >> "$GITHUB_ENV"
-          exit 0
-
-      # ----------------------------
-      # 12) LB wait + smoke tests (only if deploy ok)
-      # ----------------------------
-      - name: Wait for LoadBalancer to be ready
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
-        run: |
-          echo "Waiting for LoadBalancer..."
-          for i in {1..30}; do
-            LB=$(kubectl get svc petclinic-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-            if [ -n "$LB" ]; then
-              echo "LoadBalancer found: $LB"
-              echo "APP_URL=http://$LB" >> "$GITHUB_ENV"
-              break
-            fi
-            echo "Still waiting..."
-            sleep 10
-          done
-          if [ -z "$LB" ]; then
-            echo "LoadBalancer not ready after waiting."
-            exit 1
-          fi
-
-      - name: Wait for app to be reachable via LoadBalancer
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
-        run: |
-          echo "Waiting for app URL to respond: $APP_URL"
-          for i in {1..40}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$APP_URL" || true)
-            echo "Attempt $i: HTTP $code"
-            if [ "$code" = "200" ]; then
-              echo "App is reachable!"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "App did not become reachable in time"
-          exit 1
-
-      - name: Smoke Test Homepage (verbose)
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
-        run: |
-          curl -v --http1.1 --connect-timeout 10 --max-time 20 \
-               --retry 10 --retry-delay 6 --retry-all-errors \
-               "$APP_URL"
-
-      # ----------------------------
-      # 13) Rollback ONLY if EKS was configured (prevents localhost:8080 issue)
-      # ----------------------------
-      - name: Rollback if smoke test fails
-        if: failure() && env.EKS_READY == 'true'
-        run: |
-          echo "Smoke test failed. Rolling back..."
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
-          kubectl rollout undo deployment/petclinic-deployment
-          kubectl rollout status deployment/petclinic-deployment --timeout=180s
-
-      # ============================================================
-      # 14) Send logs to Guardian (ALWAYS) but DO NOT FAIL pipeline if unreachable
-      # ============================================================
-      - name: Ensure files exist (always)
+      # 10) Ensure files exist + Upload artifacts (always)
+      - name: Ensure CI files exist (always)
         if: always()
         shell: bash
         run: |
           [ -f maven.log ] || echo "maven.log missing" > maven.log
           [ -f docker-build.log ] || echo "docker-build.log missing" > docker-build.log
-          [ -f deploy.log ] || echo "deploy.log missing (deploy may not have run)" > deploy.log
           [ -f trivy-report.json ] || echo "{}" > trivy-report.json
-          [ -f metadata.json ] || echo "{}" > metadata.json
 
-      - name: Send logs to CI/CD Guardian (non-blocking)
-        if: always()
-        shell: bash
-        run: |
-          echo "Build/Test exit code: ${{ steps.build_test.outputs.exit_code }}"
-          echo "Docker exit code: ${DOCKER_EXIT_CODE}"
-          echo "Deploy exit code: ${DEPLOY_EXIT_CODE}"
-
-          # If GUARDIAN_URL is empty, skip safely
-          if [ -z "${GUARDIAN_URL}" ]; then
-            echo '{"status":"skipped","reason":"GUARDIAN_URL secret not set"}' > guardian-response.json
-            exit 0
-          fi
-
-          # Try calling Guardian. If it fails, write fallback JSON and continue.
-          set +e
-          curl -sS --connect-timeout 5 --max-time 20 \
-            -X POST "${GUARDIAN_URL}" \
-            -H "Authorization: Bearer ${GUARDIAN_TOKEN}" \
-            -F "meta=@metadata.json;type=application/json" \
-            -F "maven_log=@maven.log;type=text/plain" \
-            -F "docker_log=@docker-build.log;type=text/plain" \
-            -F "deploy_log=@deploy.log;type=text/plain" \
-            -F "trivy_report=@trivy-report.json;type=application/json" \
-            -o guardian-response.json
-
-          rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "{\"status\":\"error\",\"reason\":\"failed to reach guardian\",\"curl_exit_code\":$rc}" > guardian-response.json
-            echo "Guardian not reachable; continuing pipeline."
-            exit 0
-          fi
-
-          echo "Guardian response:"
-          cat guardian-response.json
-          exit 0
-
-      - name: Publish Guardian Summary to Job Summary
-        if: always()
-        shell: bash
-        run: |
-          echo "## CI/CD Guardian Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-          cat guardian-response.json >> $GITHUB_STEP_SUMMARY || echo "{}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload Guardian artifacts
+      - name: Upload CI artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: guardian-artifacts-${{ github.run_number }}
+          name: ci-artifacts
           path: |
-            metadata.json
             maven.log
             docker-build.log
-            deploy.log
             trivy-report.json
-            guardian-response.json
 
-      # ----------------------------
-      # 15) Mark job failed correctly (after Guardian step)
-      # ----------------------------
-      - name: Fail job if build/docker/deploy failed
+      # 11) Fail CI correctly (at end)
+      - name: Fail CI if build/docker failed
         if: always()
         shell: bash
         run: |
@@ -346,8 +151,4 @@ jobs:
             echo "Docker build failed."
             exit 1
           fi
-          if [ "${DEPLOY_EXIT_CODE}" != "0" ] && [ "${DEPLOY_EXIT_CODE}" != "NA" ]; then
-            echo "Deploy failed."
-            exit 1
-          fi
-          echo "All critical stages succeeded."
+          echo "CI completed successfully."

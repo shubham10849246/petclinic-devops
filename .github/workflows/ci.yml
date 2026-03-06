@@ -20,6 +20,12 @@ jobs:
       DEPLOY_EXIT_CODE: "NA"
       EKS_READY: "false"
 
+    outputs:
+      build_exit_code: ${{ steps.build_test.outputs.exit_code }}
+      image_tag: ${{ env.IMAGE_TAG }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+      docker_exit_code: ${{ env.DOCKER_EXIT_CODE }}
+
     steps:
       # ----------------------------
       # 1) Checkout
@@ -121,8 +127,7 @@ jobs:
           exit 0
 
       # ============================================================
-      # 9) Trivy (Option C): Report HIGH+CRITICAL in JSON,
-      #    BUT fail pipeline only on CRITICAL (policy step)
+      # 9) Trivy: Report HIGH+CRITICAL in JSON, fail only on CRITICAL
       # ============================================================
       - name: Install Trivy CLI
         if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
@@ -165,24 +170,64 @@ jobs:
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-deploy:
-  runs-on: ubuntu-latest
-  needs: build
+      # Upload artifacts from build so deploy job can access logs/reports
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ github.run_number }}
+          path: |
+            metadata.json
+            maven.log
+            docker-build.log
+            trivy-report.json
 
-  steps:
-    - uses: actions/checkout@v4
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      DOCKER_EXIT_CODE: ${{ needs.build.outputs.docker_exit_code }}
+      BUILD_EXIT_CODE: ${{ needs.build.outputs.build_exit_code }}
+      REGISTRY: ${{ needs.build.outputs.registry }}
+
+      GUARDIAN_URL: ${{ secrets.GUARDIAN_URL }}
+      GUARDIAN_TOKEN: ${{ secrets.GUARDIAN_TOKEN }}
+
+      # defaults
+      DEPLOY_EXIT_CODE: "NA"
+      EKS_READY: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.run_number }}
+          path: .
 
       # ----------------------------
       # 11) EKS kubeconfig + deploy (capture deploy logs)
       # ----------------------------
+      - name: Configure AWS Credentials
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Update kubeconfig
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0'
         run: |
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
           echo "EKS_READY=true" >> "$GITHUB_ENV"
 
       - name: Deploy to EKS (save logs)
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0'
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0'
         shell: bash
         run: |
           : > deploy.log
@@ -190,7 +235,7 @@ deploy:
 
           echo "=== kubectl set image ===" | tee -a deploy.log
           kubectl set image deployment/petclinic-deployment \
-            petclinic=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} 2>&1 | tee -a deploy.log
+            petclinic=${REGISTRY}/${{ secrets.ECR_REPOSITORY }}:${IMAGE_TAG} 2>&1 | tee -a deploy.log
           setimg_code=${PIPESTATUS[0]}
 
           echo "=== rollout status ===" | tee -a deploy.log
@@ -213,7 +258,7 @@ deploy:
       # 12) LB wait + smoke tests (only if deploy ok)
       # ----------------------------
       - name: Wait for LoadBalancer to be ready
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
         run: |
           echo "Waiting for LoadBalancer..."
           for i in {1..30}; do
@@ -232,7 +277,7 @@ deploy:
           fi
 
       - name: Wait for app to be reachable via LoadBalancer
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
         run: |
           echo "Waiting for app URL to respond: $APP_URL"
           for i in {1..40}; do
@@ -248,14 +293,14 @@ deploy:
           exit 1
 
       - name: Smoke Test Homepage (verbose)
-        if: steps.build_test.outputs.exit_code == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
+        if: env.BUILD_EXIT_CODE == '0' && env.DOCKER_EXIT_CODE == '0' && env.DEPLOY_EXIT_CODE == '0'
         run: |
           curl -v --http1.1 --connect-timeout 10 --max-time 20 \
                --retry 10 --retry-delay 6 --retry-all-errors \
                "$APP_URL"
 
       # ----------------------------
-      # 13) Rollback ONLY if EKS was configured (prevents localhost:8080 issue)
+      # 13) Rollback ONLY if EKS was configured
       # ----------------------------
       - name: Rollback if smoke test fails
         if: failure() && env.EKS_READY == 'true'
@@ -266,7 +311,7 @@ deploy:
           kubectl rollout status deployment/petclinic-deployment --timeout=180s
 
       # ============================================================
-      # 14) Send logs to Guardian (ALWAYS) but DO NOT FAIL pipeline if unreachable
+      # 14) Send logs to Guardian (ALWAYS) but DO NOT FAIL if unreachable
       # ============================================================
       - name: Ensure files exist (always)
         if: always()
@@ -282,17 +327,15 @@ deploy:
         if: always()
         shell: bash
         run: |
-          echo "Build/Test exit code: ${{ steps.build_test.outputs.exit_code }}"
+          echo "Build/Test exit code: ${BUILD_EXIT_CODE}"
           echo "Docker exit code: ${DOCKER_EXIT_CODE}"
           echo "Deploy exit code: ${DEPLOY_EXIT_CODE}"
 
-          # If GUARDIAN_URL is empty, skip safely
           if [ -z "${GUARDIAN_URL}" ]; then
             echo '{"status":"skipped","reason":"GUARDIAN_URL secret not set"}' > guardian-response.json
             exit 0
           fi
 
-          # Try calling Guardian. If it fails, write fallback JSON and continue.
           set +e
           curl -sS --connect-timeout 5 --max-time 20 \
             -X POST "${GUARDIAN_URL}" \
@@ -345,7 +388,7 @@ deploy:
         if: always()
         shell: bash
         run: |
-          if [ "${{ steps.build_test.outputs.exit_code }}" != "0" ]; then
+          if [ "${BUILD_EXIT_CODE}" != "0" ]; then
             echo "Build/Test failed."
             exit 1
           fi
@@ -357,4 +400,4 @@ deploy:
             echo "Deploy failed."
             exit 1
           fi
-          echo "All critical stages succeeded." 
+          echo "All critical stages succeeded."

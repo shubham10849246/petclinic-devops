@@ -48,6 +48,7 @@ jobs:
       # 5) Deploy Artifact to JFrog (only if build ok)
       - name: Deploy Artifact to JFrog
         if: steps.build_test.outputs.exit_code == '0'
+        continue-on-error: true
         run: mvn deploy --settings .mvn/settings.xml
         env:
           JFROG_URL: ${{ secrets.JFROG_URL }}
